@@ -1,5 +1,10 @@
 fastapi
 uvicorn
+numpy
+pandas
+yfinance
+ta
 requests
-python-dotenv
-beautifulsoup4
+plotly
+textblob
+scikit-learn
