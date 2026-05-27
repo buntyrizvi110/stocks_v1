@@ -1,10 +1,11 @@
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
 numpy
 pandas
 yfinance
-ta
-requests
 plotly
-textblob
-scikit-learn
+openai
+jinja2
+python-multipart
+aiofiles
