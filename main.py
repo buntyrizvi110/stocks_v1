@@ -1,5 +1,4 @@
-
-import os, json, re, asyncio, threading, math
+import os, json, re, asyncio, threading, math, time
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +34,54 @@ if not SIGNAL_TRACKER_FILE.parent.exists():
 
 HIT_LOCK = threading.Lock()
 TRACKER_LOCK = threading.Lock()
+
+# ============================================================
+# AZURE PERFORMANCE CACHE
+# ============================================================
+# Keeps UI unchanged while avoiding repeated Yahoo/Finnhub/OpenAI calls on every refresh.
+# Azure App Service can be slow with repeated external calls; these caches keep responses fast.
+CACHE_LOCK = threading.RLock()
+CANDLE_CACHE = {}
+NEWS_CACHE = {}
+AI_CACHE = {}
+
+CANDLE_TTL_SECONDS = int(os.getenv("CANDLE_TTL_SECONDS", "45"))      # chart/signal candles
+NEWS_TTL_SECONDS = int(os.getenv("NEWS_TTL_SECONDS", "180"))        # Finnhub news
+AI_TTL_SECONDS = int(os.getenv("AI_TTL_SECONDS", "240"))            # OpenAI sentiment
+
+def _cache_get(cache, key, ttl):
+    now = time.time()
+    with CACHE_LOCK:
+        item = cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if now - ts <= ttl:
+            try:
+                return value.copy() if hasattr(value, "copy") else value
+            except Exception:
+                return value
+        cache.pop(key, None)
+    return None
+
+def _cache_set(cache, key, value):
+    with CACHE_LOCK:
+        try:
+            cache[key] = (time.time(), value.copy() if hasattr(value, "copy") else value)
+        except Exception:
+            cache[key] = (time.time(), value)
+        # prevent unbounded growth on long-running Azure instances
+        if len(cache) > 200:
+            oldest = sorted(cache.items(), key=lambda kv: kv[1][0])[:50]
+            for k, _ in oldest:
+                cache.pop(k, None)
+
+def _news_fingerprint(news):
+    try:
+        return "|".join([(n.get("headline","")[:80] + str(n.get("source",""))) for n in (news or [])[:8]])
+    except Exception:
+        return ""
+
 
 
 def read_hit_count() -> int:
@@ -96,7 +143,7 @@ def clean(x):
 # ============================================================
 # MARKET DATA
 # ============================================================
-def load_candles(asset_key, tf):
+def _load_candles_uncached(asset_key, tf):
     meta = ASSETS[asset_key]
     cfg = INTERVALS[tf]
     symbols = meta.get("yf")
@@ -165,6 +212,23 @@ def load_candles(asset_key, tf):
                     pass
     return pd.DataFrame()
 
+
+
+def load_candles(asset_key, tf):
+    """
+    Cached candle loader.
+    First call may still contact Yahoo, but auto-refresh / LOV changes reuse fresh data,
+    making Azure responses much faster without changing UI or functionality.
+    """
+    key = (asset_key.upper(), tf.upper())
+    cached = _cache_get(CANDLE_CACHE, key, CANDLE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+
+    df = _load_candles_uncached(asset_key, tf)
+    if df is not None and not df.empty:
+        _cache_set(CANDLE_CACHE, key, df)
+    return df
 
 # ============================================================
 # INDICATORS + INSTITUTIONAL FILTERS
@@ -456,6 +520,10 @@ def technical_score(df, mtf=None):
 # NEWS + AI - news display kept as original behavior
 # ============================================================
 async def fetch_finnhub_news(asset_key):
+    cache_key = asset_key.upper()
+    cached = _cache_get(NEWS_CACHE, cache_key, NEWS_TTL_SECONDS)
+    if cached is not None:
+        return cached
     if not FINNHUB_API_KEY:
         return []
     url = "https://finnhub.io/api/v1/news"
@@ -480,7 +548,9 @@ async def fetch_finnhub_news(asset_key):
         relevance += sum(1 for k in geopolitics if k in text) * 1.3
         if relevance > 0:
             out.append({"headline": headline, "summary": summary[:180], "source": source, "url": n.get("url", ""), "relevance": relevance})
-    return sorted(out, key=lambda x: x["relevance"], reverse=True)[:10]
+    final_news = sorted(out, key=lambda x: x["relevance"], reverse=True)[:10]
+    _cache_set(NEWS_CACHE, cache_key, final_news)
+    return final_news
 
 
 def news_lexicon_score(news, asset_key):
@@ -505,6 +575,17 @@ def news_lexicon_score(news, asset_key):
 
 
 async def openai_sentiment(asset_key, news, tech, institutional_context=None):
+    ai_key = (
+        asset_key.upper(),
+        round(safe_float(tech.get("score", 0)), 1),
+        round(safe_float(tech.get("price", 0)), 1),
+        round(safe_float(tech.get("rsi", 50)), 1),
+        _news_fingerprint(news),
+    )
+    cached = _cache_get(AI_CACHE, ai_key, AI_TTL_SECONDS)
+    if cached is not None:
+        return cached
+
     if not OPENAI_API_KEY:
         return {"score": 0, "bias": "NEUTRAL", "summary": "OpenAI key missing. Using fallback sentiment.", "risk": "AI sentiment unavailable."}
     headlines = [f"{n['source']}: {n['headline']} - {n['summary']}" for n in news[:8]]
@@ -534,7 +615,9 @@ Return only JSON:
         text = response.choices[0].message.content.strip()
         text = re.sub(r"^```json|```$", "", text, flags=re.I).strip()
         data = json.loads(text)
-        return {"score": clamp(data.get("score", 0)), "bias": data.get("bias", "NEUTRAL"), "summary": data.get("summary", ""), "risk": data.get("risk", "")}
+        result = {"score": clamp(data.get("score", 0)), "bias": data.get("bias", "NEUTRAL"), "summary": data.get("summary", ""), "risk": data.get("risk", "")}
+        _cache_set(AI_CACHE, ai_key, result)
+        return result
     except Exception as e:
         return {"score": 0, "bias": "NEUTRAL", "summary": "OpenAI sentiment failed. Fallback active.", "risk": str(e)[:100]}
 
@@ -679,12 +762,23 @@ async def process(asset_key, tf):
     loop = asyncio.get_running_loop()
 
     # Chart follows UI timeframe; signal and all technicals remain fixed to 30M.
-    chart_future = loop.run_in_executor(executor, load_candles, asset_key, tf)
-    signal_future = loop.run_in_executor(executor, load_candles, asset_key, "30M")
-    h1_future = loop.run_in_executor(executor, load_candles, asset_key, "1H")
-    d1_future = loop.run_in_executor(executor, load_candles, asset_key, "1D")
+    # Performance tuning:
+    # - If chart timeframe is 30M, reuse the same dataframe for signal + chart.
+    # - Candle/news/AI loaders are cached, so Azure auto-refresh is fast.
+    # - Higher-timeframe confirmation remains supported but usually returns from cache.
+    if tf == "30M":
+        signal_df = await loop.run_in_executor(executor, load_candles, asset_key, "30M")
+        chart_df = signal_df.copy()
+        h1_future = loop.run_in_executor(executor, load_candles, asset_key, "1H")
+        d1_future = loop.run_in_executor(executor, load_candles, asset_key, "1D")
+        h1_df, d1_df = await asyncio.gather(h1_future, d1_future)
+    else:
+        chart_future = loop.run_in_executor(executor, load_candles, asset_key, tf)
+        signal_future = loop.run_in_executor(executor, load_candles, asset_key, "30M")
+        h1_future = loop.run_in_executor(executor, load_candles, asset_key, "1H")
+        d1_future = loop.run_in_executor(executor, load_candles, asset_key, "1D")
+        chart_df, signal_df, h1_df, d1_df = await asyncio.gather(chart_future, signal_future, h1_future, d1_future)
 
-    chart_df, signal_df, h1_df, d1_df = await asyncio.gather(chart_future, signal_future, h1_future, d1_future)
     if chart_df.empty and signal_df.empty:
         raise RuntimeError("No candle data returned.")
     if chart_df.empty:
@@ -694,12 +788,13 @@ async def process(asset_key, tf):
 
     mtf = multi_timeframe_confirmation({"30M": signal_df, "1H": h1_df, "1D": d1_df})
     tech = technical_score(signal_df, mtf=mtf)
+
+    # News and AI are the slowest non-price calls; both are TTL-cached.
     news = await fetch_finnhub_news(asset_key)
     news_score = news_lexicon_score(news, asset_key)
     event_risk = economic_event_filter(news, asset_key)
     ai = await openai_sentiment(asset_key, news, tech, {"mtf": mtf, "event_risk": event_risk})
 
-    # First fusion before tracker, then update tracker and finalize confidence.
     fusion_pre = fusion_signal(tech, news_score, ai, mtf=mtf, event_risk=event_risk)
     tracker = update_signal_tracker(asset_key, fusion_pre["signal"], tech["price"], fusion_pre["confidence"])
     fusion = fusion_signal(tech, news_score, ai, mtf=mtf, event_risk=event_risk, tracker=tracker)
@@ -720,7 +815,6 @@ async def process(asset_key, tf):
         "institutional": {"mtf": mtf, "event_risk": event_risk, "tracker": tracker},
         "updated": datetime.now().strftime("%H:%M:%S"),
     }
-
 
 @app.get("/api/hit")
 async def api_hit():
