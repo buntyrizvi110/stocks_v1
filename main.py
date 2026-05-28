@@ -129,6 +129,7 @@ def load_candles(asset_key, tf):
         progress=False,
         threads=False,
     )
+
     if df.empty and tf == "1M":
         df = yf.download(
             meta["yf"],
@@ -137,7 +138,8 @@ def load_candles(asset_key, tf):
             auto_adjust=False,
             progress=False,
             threads=False,
-        ) 
+        )
+
     if df.empty:
         return pd.DataFrame()
 
@@ -145,9 +147,23 @@ def load_candles(asset_key, tf):
         df.columns = [c[0] for c in df.columns]
 
     df = df.rename(columns=str.title).dropna().reset_index()
-    time_col = "Datetime" if "Datetime" in df.columns else "Date"
 
-    df["time"] = pd.to_datetime(df[time_col])
+    time_col = None
+    for col in ["Datetime", "Date", "Index", "index"]:
+        if col in df.columns:
+            time_col = col
+            break
+
+    if time_col is None:
+        df["time"] = pd.to_datetime(df.index)
+    else:
+        df["time"] = pd.to_datetime(df[time_col])
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = 0
+
     df = df[["time", "Open", "High", "Low", "Close", "Volume"]]
     df.columns = ["time", "open", "high", "low", "close", "volume"]
 
