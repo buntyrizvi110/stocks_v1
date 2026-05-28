@@ -129,7 +129,15 @@ def load_candles(asset_key, tf):
         progress=False,
         threads=False,
     )
-
+    if df.empty and tf == "1M":
+        df = yf.download(
+            meta["yf"],
+            period="5d",
+            interval="5m",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        ) 
     if df.empty:
         return pd.DataFrame()
 
@@ -497,9 +505,18 @@ async def api_signal(asset: str = Query("WTI"), tf: str = Query("1M")):
 
     try:
         return await process(asset, tf)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
 
+    except Exception as e:
+        import traceback
+
+        print(traceback.format_exc())
+
+        return JSONResponse(
+            {
+                "error": str(e)
+            },
+            status_code=500
+        )
 
 HTML = r"""
 <!doctype html>
