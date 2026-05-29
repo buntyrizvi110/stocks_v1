@@ -43,10 +43,26 @@ CACHE_LOCK = threading.RLock()
 CANDLE_CACHE = {}
 NEWS_CACHE = {}
 AI_CACHE = {}
+RESPONSE_CACHE = {}
+CHART_CACHE = {}
 
-CANDLE_TTL_SECONDS = int(os.getenv("CANDLE_TTL_SECONDS", "90"))      # chart/signal candles
+CANDLE_TTL_SECONDS = int(os.getenv("CANDLE_TTL_SECONDS", "180"))     # Yahoo candle data
 NEWS_TTL_SECONDS = int(os.getenv("NEWS_TTL_SECONDS", "300"))        # Finnhub news
-AI_TTL_SECONDS = int(os.getenv("AI_TTL_SECONDS", "420"))            # OpenAI sentiment
+AI_TTL_SECONDS = int(os.getenv("AI_TTL_SECONDS", "600"))            # OpenAI sentiment
+RESPONSE_TTL_SECONDS = int(os.getenv("RESPONSE_TTL_SECONDS", "25")) # smooth repeat refresh
+CHART_TTL_SECONDS = int(os.getenv("CHART_TTL_SECONDS", "120"))      # chart JSON cache
+
+def _safe_copy(value):
+    try:
+        if isinstance(value, pd.DataFrame):
+            return value.copy(deep=False)
+        if isinstance(value, dict):
+            return json.loads(json.dumps(value))
+        if isinstance(value, list):
+            return json.loads(json.dumps(value))
+        return value.copy() if hasattr(value, "copy") else value
+    except Exception:
+        return value
 
 def _cache_get(cache, key, ttl):
     now = time.time()
@@ -56,19 +72,13 @@ def _cache_get(cache, key, ttl):
             return None
         ts, value = item
         if now - ts <= ttl:
-            try:
-                return value.copy() if hasattr(value, "copy") else value
-            except Exception:
-                return value
+            return _safe_copy(value)
         cache.pop(key, None)
     return None
 
 def _cache_set(cache, key, value):
     with CACHE_LOCK:
-        try:
-            cache[key] = (time.time(), value.copy() if hasattr(value, "copy") else value)
-        except Exception:
-            cache[key] = (time.time(), value)
+        cache[key] = (time.time(), _safe_copy(value))
         # prevent unbounded growth on long-running Azure instances
         if len(cache) > 200:
             oldest = sorted(cache.items(), key=lambda kv: kv[1][0])[:50]
@@ -311,7 +321,7 @@ def volume_profile(df, bins=24):
         poc_interval = grouped.idxmax()
         poc = float((poc_interval.left + poc_interval.right) / 2)
         price = safe_float(d["close"].iloc[-1])
-        atr = safe_float(add_indicators(d)["atr"].iloc[-1], price * 0.005)
+        atr = safe_float((d["high"] - d["low"]).tail(14).mean(), price * 0.005)
         bias = clamp((price - poc) / max(atr, price * 0.001) * 10, -15, 15)
         return {"poc": round(poc, 4), "bias": round(bias, 2)}
     except Exception:
@@ -394,28 +404,42 @@ def raw_technical_model(df):
 
 
 def backtest_technical(df, horizon=3):
+    """
+    Fast Azure-safe backtest approximation.
+    Keeps the same output schema but avoids repeatedly recalculating indicators
+    inside a Python loop, which was a major reason for slow refreshes.
+    """
     d = add_indicators(df).tail(240).reset_index(drop=True)
-    results = []
     if len(d) < 90:
         return {"win_rate": 0.50, "trades": 0, "expectancy": 0.0, "score_adj": 0}
-    for i in range(70, len(d) - horizon):
-        sub = d.iloc[:i+1].copy()
-        score = raw_technical_model(sub)
-        if abs(score) < 24:
-            continue
-        direction = 1 if score > 0 else -1
-        entry = safe_float(d["close"].iloc[i])
-        exitp = safe_float(d["close"].iloc[i+horizon])
-        atr = max(safe_float(d["atr"].iloc[i], entry * 0.005), entry * 0.0005)
-        r_mult = ((exitp - entry) * direction) / atr
-        results.append(r_mult)
-    if not results:
+
+    trend = np.where(d["ema9"] > d["ema21"], 1, -1)
+    trend += np.where(d["ema21"] > d["ema50"], 1, -1)
+    trend += np.where(d["close"] > d["ema200"], 1, -1)
+    momentum = np.where(d["macd"] > d["macd_signal"], 1, -1)
+    rsi_ok = np.where(d["rsi"] >= 52, 1, np.where(d["rsi"] <= 48, -1, 0))
+    proxy_score = trend * 14 + momentum * 14 + rsi_ok * 8
+
+    entries = np.where(np.abs(proxy_score) >= 24)[0]
+    entries = entries[(entries >= 70) & (entries < len(d) - horizon)]
+    if len(entries) == 0:
         return {"win_rate": 0.50, "trades": 0, "expectancy": 0.0, "score_adj": 0}
-    arr = np.array(results, dtype=float)
-    win_rate = float((arr > 0).mean())
-    expectancy = float(arr.mean())
+
+    close = d["close"].to_numpy(dtype=float)
+    atr = d["atr"].replace(0, np.nan).fillna(d["close"] * 0.005).to_numpy(dtype=float)
+    direction = np.where(proxy_score[entries] > 0, 1, -1)
+    entry = close[entries]
+    exitp = close[entries + horizon]
+    denom = np.maximum(atr[entries], entry * 0.0005)
+    r_mult = ((exitp - entry) * direction) / denom
+
+    if len(r_mult) == 0:
+        return {"win_rate": 0.50, "trades": 0, "expectancy": 0.0, "score_adj": 0}
+
+    win_rate = float((r_mult > 0).mean())
+    expectancy = float(np.mean(r_mult))
     score_adj = clamp((win_rate - 0.50) * 50 + expectancy * 8, -12, 12)
-    return {"win_rate": round(win_rate, 3), "trades": int(len(arr)), "expectancy": round(expectancy, 3), "score_adj": round(score_adj, 2)}
+    return {"win_rate": round(win_rate, 3), "trades": int(len(r_mult)), "expectancy": round(expectancy, 3), "score_adj": round(score_adj, 2)}
 
 
 def multi_timeframe_confirmation(dfs):
@@ -528,7 +552,7 @@ async def fetch_finnhub_news(asset_key):
     url = "https://finnhub.io/api/v1/news"
     params = {"category": "general", "token": FINNHUB_API_KEY}
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
+        async with httpx.AsyncClient(timeout=6) as client:
             r = await client.get(url, params=params)
             r.raise_for_status()
             raw = r.json()
@@ -746,7 +770,17 @@ def build_chart(df, asset_name):
     Keeps the same frontend Plotly.js UI, but removes the heavy Python plotly package.
     This reduces build size and memory usage during Azure Oryx deployment.
     """
-    d = add_indicators(df).tail(260)
+    try:
+        last_time = str(pd.to_datetime(df["time"].iloc[-1]))
+        last_close = round(safe_float(df["close"].iloc[-1]), 4)
+        chart_key = (asset_name, len(df), last_time, last_close)
+        cached_chart = _cache_get(CHART_CACHE, chart_key, CHART_TTL_SECONDS)
+        if cached_chart is not None:
+            return cached_chart
+    except Exception:
+        chart_key = None
+
+    d = add_indicators(df).tail(220)
     times = pd.to_datetime(d["time"]).dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
 
     lows = pd.to_numeric(d["low"], errors="coerce").dropna()
@@ -818,10 +852,19 @@ def build_chart(df, asset_name):
         "legend": {"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
         "uirevision": "keep",
     }
-    return {"data": data, "layout": layout}
+    result = {"data": data, "layout": layout}
+    if chart_key is not None:
+        _cache_set(CHART_CACHE, chart_key, result)
+    return result
 
 
 async def process(asset_key, tf):
+    response_key = (asset_key.upper(), tf.upper())
+    cached_response = _cache_get(RESPONSE_CACHE, response_key, RESPONSE_TTL_SECONDS)
+    if cached_response is not None:
+        cached_response["updated"] = datetime.now().strftime("%H:%M:%S")
+        return cached_response
+
     loop = asyncio.get_running_loop()
 
     # Chart follows UI timeframe; signal and all technicals remain fixed to 30M.
@@ -864,7 +907,7 @@ async def process(asset_key, tf):
 
     chart = build_chart(chart_df, ASSETS[asset_key]["name"])
 
-    return {
+    result = {
         "asset_key": asset_key,
         "asset": ASSETS[asset_key],
         "tf": tf,
@@ -878,6 +921,8 @@ async def process(asset_key, tf):
         "institutional": {"mtf": mtf, "event_risk": event_risk, "tracker": tracker},
         "updated": datetime.now().strftime("%H:%M:%S"),
     }
+    _cache_set(RESPONSE_CACHE, response_key, result)
+    return result
 
 @app.get("/api/hit")
 async def api_hit():
@@ -984,8 +1029,8 @@ async function updateHits(){
 }
 function init(){Object.keys(ASSETS).forEach(k=>assetSelect.innerHTML+=`<option value="${k}">${ASSETS[k][0]} ${ASSETS[k][1]}</option>`);TFS.forEach(t=>tfSelect.innerHTML+=`<option value="${t}">${t}</option>`);assetSelect.value=asset;tfSelect.value=tf;assetSelect.onchange=()=>{asset=assetSelect.value;loadData(true)};tfSelect.onchange=()=>{tf=tfSelect.value;loadData(true)};updateHits();loadData(true);setInterval(()=>loadData(false),30000)}
 function colorFor(label){if(label==="BULLISH")return "#22c55e"; if(label==="BEARISH")return "#ef4444"; return "#f59e0b"}
-function setLoading(v){busy=v;dashboard.classList.toggle('loading',v);statusText.innerText=v?'Loading':'Ready';livePill.innerText=v?'● Updating':'● Live feed'}
-async function loadData(manual=false){if(busy&&!manual)return;setLoading(true);try{error.innerText="";refreshBar.style.animation='none';void refreshBar.offsetWidth;refreshBar.style.animation='bar 30s linear infinite';const r=await fetch(`/api/signal?asset=${asset}&tf=${tf}&_=${Date.now()}`);const d=await r.json();if(d.error)throw new Error(d.error);render(d)}catch(e){error.innerText="Error: "+e.message}finally{setLoading(false)}}
+function setLoading(v,manual=false){busy=v;if(manual){dashboard.classList.toggle('loading',v)}else{dashboard.classList.remove('loading')}statusText.innerText=v?'Loading':'Ready';livePill.innerText=v?'● Updating':'● Live feed'}
+async function loadData(manual=false){if(busy&&!manual)return;setLoading(true,manual);let controller=new AbortController();let timer=setTimeout(()=>controller.abort(),manual?18000:9000);try{error.innerText="";refreshBar.style.animation='none';void refreshBar.offsetWidth;refreshBar.style.animation='bar 30s linear infinite';const r=await fetch(`/api/signal?asset=${asset}&tf=${tf}&_=${Date.now()}`,{signal:controller.signal});const d=await r.json();if(d.error)throw new Error(d.error);render(d)}catch(e){if(manual){error.innerText="Error: "+e.message}}finally{clearTimeout(timer);setLoading(false,manual)}}
 function render(d){const label=d.fusion.label||'NEUTRAL', sig=d.fusion.signal||'HOLD / WAIT', c=Number(d.fusion.confidence||0), fusion=Number(d.fusion.fusion||0), col=colorFor(label);assetIcon.innerText=d.asset.icon;assetName.innerText=d.asset.name;topPrice.innerText=d.tech.price;updated.innerText=`Updated ${d.updated} • Chart ${d.tf} • Signal ${d.signal_tf||"30M"}`;signalText.innerText=sig;signalText.style.color=col;signalSub.innerText=`${label} setup from technical + news + AI fusion`;meterValue.innerText=c.toFixed(1);meterValue.style.color=col;needle.style.transform=`rotate(${(c/100*180)-90}deg)`;fusionScore.innerText=(fusion>0?'+':'')+fusion.toFixed(2);aiBiasMini.innerText=d.ai.bias||label;entryVal.innerText=d.tech.entry;riskMini.innerText=(d.ai.risk||'Normal').slice(0,18);aiSummary.innerText=d.ai.summary||'No AI summary returned.';aiScore.innerText=`AI ${Number(d.ai.score||0).toFixed(0)}`;biasTag.innerText='BIAS '+label;biasTag.style.color=col;confTag.innerText='CONF '+c.toFixed(1)+'%';chartLabel.innerText=`${d.asset.name} • Chart ${d.tf} • Signal fixed ${d.signal_tf||"30M"} • Candles + EMA 9/21/50`;
 techStats.innerHTML=[['PRICE',d.tech.price],['RSI 14',d.tech.rsi],['MACD',d.tech.macd],['ATR 14',d.tech.atr],['TARGET',d.tech.target],['STOP LOSS',d.tech.stop]].map(([a,b])=>`<div class="stat-card"><span>${a}</span><b>${b}</b></div>`).join('');
 let layout=d.chart.layout||{};layout.autosize=true;layout.height=null;layout.margin={l:58,r:34,t:22,b:46};layout.paper_bgcolor='rgba(0,0,0,0)';layout.plot_bgcolor='rgba(2,6,23,.34)';layout.font={color:'#eaf2ff',size:11};layout.legend={orientation:'h',y:1.04,x:0,font:{size:10}};layout.xaxis={...(layout.xaxis||{}),type:'date',rangeslider:{visible:false},gridcolor:'rgba(148,163,184,.10)',automargin:true};layout.yaxis={...(layout.yaxis||{}),gridcolor:'rgba(148,163,184,.10)',automargin:true,zeroline:false};Plotly.react('chart',d.chart.data,layout,{displayModeBar:false,responsive:true});setTimeout(()=>Plotly.Plots.resize('chart'),180);
