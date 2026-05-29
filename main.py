@@ -7,7 +7,6 @@ import httpx
 import numpy as np
 import pandas as pd
 import yfinance as yf
-import plotly.graph_objects as go
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -20,7 +19,7 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 app = FastAPI(title="Commodity Sentiment Terminal - By Abbas")
-executor = ThreadPoolExecutor(max_workers=8)
+executor = ThreadPoolExecutor(max_workers=int(os.getenv('APP_WORKERS', '3')))
 
 # ============================================================
 # AZURE GLOBAL HIT COUNTER + SIGNAL MEMORY
@@ -45,9 +44,9 @@ CANDLE_CACHE = {}
 NEWS_CACHE = {}
 AI_CACHE = {}
 
-CANDLE_TTL_SECONDS = int(os.getenv("CANDLE_TTL_SECONDS", "45"))      # chart/signal candles
-NEWS_TTL_SECONDS = int(os.getenv("NEWS_TTL_SECONDS", "180"))        # Finnhub news
-AI_TTL_SECONDS = int(os.getenv("AI_TTL_SECONDS", "240"))            # OpenAI sentiment
+CANDLE_TTL_SECONDS = int(os.getenv("CANDLE_TTL_SECONDS", "90"))      # chart/signal candles
+NEWS_TTL_SECONDS = int(os.getenv("NEWS_TTL_SECONDS", "300"))        # Finnhub news
+AI_TTL_SECONDS = int(os.getenv("AI_TTL_SECONDS", "420"))            # OpenAI sentiment
 
 def _cache_get(cache, key, ttl):
     now = time.time()
@@ -195,11 +194,11 @@ def _load_candles_uncached(asset_key, tf):
         out = out.sort_values("time").drop_duplicates("time")
         if len(out) < 30 or out["close"].nunique() <= 2:
             return pd.DataFrame()
-        return out.tail(800)
+        return out.tail(420)
 
     for symbol in symbols:
         for interval, period in attempts:
-            for mode in ("download", "history"):
+            for mode in ("download",):
                 try:
                     if mode == "download":
                         raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False, group_by="column")
@@ -299,7 +298,7 @@ def support_resistance(df, lookback=80):
 
 
 def volume_profile(df, bins=24):
-    d = df.tail(160).copy()
+    d = df.tail(120).copy()
     typical = (d["high"] + d["low"] + d["close"]) / 3
     vol = d["volume"].replace(0, np.nan)
     if vol.isna().all() or vol.sum(skipna=True) <= 0:
@@ -395,7 +394,7 @@ def raw_technical_model(df):
 
 
 def backtest_technical(df, horizon=3):
-    d = add_indicators(df).tail(420).reset_index(drop=True)
+    d = add_indicators(df).tail(240).reset_index(drop=True)
     results = []
     if len(d) < 90:
         return {"win_rate": 0.50, "trades": 0, "expectancy": 0.0, "score_adj": 0}
@@ -739,23 +738,87 @@ def fusion_signal(tech, news_score, ai, mtf=None, event_risk=None, tracker=None)
 
 
 # ============================================================
-# CHART - UI unchanged
+# CHART - UI unchanged, lightweight backend JSON
 # ============================================================
 def build_chart(df, asset_name):
-    d = add_indicators(df)
-    x = pd.to_datetime(d["time"])
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=x, open=d["open"], high=d["high"], low=d["low"], close=d["close"], name=asset_name, increasing_line_width=1, decreasing_line_width=1))
-    fig.add_trace(go.Scatter(x=x, y=d["ema9"], name="EMA9", mode="lines", line=dict(width=1)))
-    fig.add_trace(go.Scatter(x=x, y=d["ema21"], name="EMA21", mode="lines", line=dict(width=1)))
-    fig.add_trace(go.Scatter(x=x, y=d["ema50"], name="EMA50", mode="lines", line=dict(width=1)))
-    y_min = float(d["low"].tail(200).min())
-    y_max = float(d["high"].tail(200).max())
-    pad = max((y_max - y_min) * 0.14, y_max * 0.003)
-    fig.update_layout(template="plotly_dark", height=330, margin=dict(l=58, r=34, t=22, b=46), paper_bgcolor="#111a26", plot_bgcolor="#111a26", font=dict(color="#dce7f3", size=10), xaxis_rangeslider_visible=False, legend=dict(orientation="h", y=1.02, x=0, font=dict(size=9)), uirevision="keep")
-    fig.update_xaxes(type="date", showgrid=True, automargin=True)
-    fig.update_yaxes(range=[y_min - pad, y_max + pad], fixedrange=False, automargin=True, zeroline=False)
-    return json.loads(fig.to_json())
+    """
+    Azure-light chart builder.
+    Keeps the same frontend Plotly.js UI, but removes the heavy Python plotly package.
+    This reduces build size and memory usage during Azure Oryx deployment.
+    """
+    d = add_indicators(df).tail(260)
+    times = pd.to_datetime(d["time"]).dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
+
+    lows = pd.to_numeric(d["low"], errors="coerce").dropna()
+    highs = pd.to_numeric(d["high"], errors="coerce").dropna()
+    if lows.empty or highs.empty:
+        y_min, y_max = 0, 1
+    else:
+        y_min = float(lows.tail(200).min())
+        y_max = float(highs.tail(200).max())
+    pad = max((y_max - y_min) * 0.14, abs(y_max) * 0.003, 0.01)
+
+    data = [
+        {
+            "type": "candlestick",
+            "x": times,
+            "open": d["open"].round(6).tolist(),
+            "high": d["high"].round(6).tolist(),
+            "low": d["low"].round(6).tolist(),
+            "close": d["close"].round(6).tolist(),
+            "name": asset_name,
+            "increasing": {"line": {"width": 1}},
+            "decreasing": {"line": {"width": 1}},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "x": times,
+            "y": d["ema9"].round(6).tolist(),
+            "name": "EMA9",
+            "line": {"width": 1},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "x": times,
+            "y": d["ema21"].round(6).tolist(),
+            "name": "EMA21",
+            "line": {"width": 1},
+        },
+        {
+            "type": "scatter",
+            "mode": "lines",
+            "x": times,
+            "y": d["ema50"].round(6).tolist(),
+            "name": "EMA50",
+            "line": {"width": 1},
+        },
+    ]
+
+    layout = {
+        "template": "plotly_dark",
+        "height": 330,
+        "margin": {"l": 58, "r": 34, "t": 22, "b": 46},
+        "paper_bgcolor": "#111a26",
+        "plot_bgcolor": "#111a26",
+        "font": {"color": "#dce7f3", "size": 10},
+        "xaxis": {
+            "type": "date",
+            "rangeslider": {"visible": False},
+            "showgrid": True,
+            "automargin": True,
+        },
+        "yaxis": {
+            "range": [y_min - pad, y_max + pad],
+            "fixedrange": False,
+            "automargin": True,
+            "zeroline": False,
+        },
+        "legend": {"orientation": "h", "y": 1.02, "x": 0, "font": {"size": 9}},
+        "uirevision": "keep",
+    }
+    return {"data": data, "layout": layout}
 
 
 async def process(asset_key, tf):
