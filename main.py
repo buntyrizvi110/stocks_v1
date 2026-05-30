@@ -1,5 +1,6 @@
 import os, json, re, asyncio, threading, math, time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -17,6 +18,7 @@ from openai import OpenAI
 # ============================================================
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Dubai")
 
 app = FastAPI(title="Commodity Sentiment Terminal - By Abbas")
 executor = ThreadPoolExecutor(max_workers=int(os.getenv('APP_WORKERS', '3')))
@@ -764,6 +766,44 @@ def fusion_signal(tech, news_score, ai, mtf=None, event_risk=None, tracker=None)
 # ============================================================
 # CHART - UI unchanged, lightweight backend JSON
 # ============================================================
+def _to_local_chart_times(series):
+    """
+    Convert all candle timestamps to the configured local timezone before sending
+    them to Plotly. Default is Asia/Dubai, override with LOCAL_TIMEZONE if needed.
+    """
+    try:
+        local_tz = ZoneInfo(LOCAL_TIMEZONE)
+    except Exception:
+        local_tz = ZoneInfo("Asia/Dubai")
+    try:
+        times = pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(local_tz)
+        return times.dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+    except Exception:
+        return pd.to_datetime(series, errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S").tolist()
+
+
+def _chart_tick_arrays(times, max_ticks=4):
+    """Return sparse x-axis ticks with two-row date/time labels."""
+    vals = [str(t) for t in (times or []) if str(t) and str(t).lower() != "nat"]
+    if not vals:
+        return [], []
+    step = max(1, int(math.ceil(len(vals) / max_ticks)))
+    tickvals = vals[::step]
+    if vals[-1] not in tickvals:
+        tickvals.append(vals[-1])
+    ticktext = []
+    for v in tickvals:
+        try:
+            dt = pd.to_datetime(v, errors="coerce")
+            if pd.isna(dt):
+                ticktext.append(v)
+            else:
+                ticktext.append(dt.strftime("%d %b %Y<br>%H:%M"))
+        except Exception:
+            ticktext.append(v)
+    return tickvals, ticktext
+
+
 def build_chart(df, asset_name):
     """
     Azure-light chart builder.
@@ -781,7 +821,8 @@ def build_chart(df, asset_name):
         chart_key = None
 
     d = add_indicators(df).tail(220)
-    times = pd.to_datetime(d["time"]).dt.strftime("%Y-%m-%dT%H:%M:%S").tolist()
+    times = _to_local_chart_times(d["time"])
+    tickvals, ticktext = _chart_tick_arrays(times)
 
     lows = pd.to_numeric(d["low"], errors="coerce").dropna()
     highs = pd.to_numeric(d["high"], errors="coerce").dropna()
@@ -833,7 +874,7 @@ def build_chart(df, asset_name):
     layout = {
         "template": "plotly_dark",
         "height": 330,
-        "margin": {"l": 58, "r": 34, "t": 22, "b": 46},
+        "margin": {"l": 58, "r": 34, "t": 22, "b": 118},
         "paper_bgcolor": "#111a26",
         "plot_bgcolor": "#111a26",
         "font": {"color": "#dce7f3", "size": 10},
@@ -842,10 +883,17 @@ def build_chart(df, asset_name):
             "rangeslider": {"visible": False},
             "showgrid": True,
             "automargin": True,
+            "tickmode": "array",
+            "tickvals": tickvals,
+            "ticktext": ticktext,
+            "tickangle": 0,
+            "tickfont": {"size": 9},
+            "ticklabelstandoff": 10,
+            "fixedrange": True,
         },
         "yaxis": {
             "range": [y_min - pad, y_max + pad],
-            "fixedrange": False,
+            "fixedrange": True,
             "automargin": True,
             "zeroline": False,
         },
@@ -1033,7 +1081,7 @@ function setLoading(v,manual=false){busy=v;if(manual){dashboard.classList.toggle
 async function loadData(manual=false){if(busy&&!manual)return;setLoading(true,manual);let controller=new AbortController();let timer=setTimeout(()=>controller.abort(),manual?18000:9000);try{error.innerText="";refreshBar.style.animation='none';void refreshBar.offsetWidth;refreshBar.style.animation='bar 30s linear infinite';const r=await fetch(`/api/signal?asset=${asset}&tf=${tf}&_=${Date.now()}`,{signal:controller.signal});const d=await r.json();if(d.error)throw new Error(d.error);render(d)}catch(e){if(manual){error.innerText="Error: "+e.message}}finally{clearTimeout(timer);setLoading(false,manual)}}
 function render(d){const label=d.fusion.label||'NEUTRAL', sig=d.fusion.signal||'HOLD / WAIT', c=Number(d.fusion.confidence||0), fusion=Number(d.fusion.fusion||0), col=colorFor(label);assetIcon.innerText=d.asset.icon;assetName.innerText=d.asset.name;topPrice.innerText=d.tech.price;updated.innerText=`Updated ${d.updated} • Chart ${d.tf} • Signal ${d.signal_tf||"30M"}`;signalText.innerText=sig;signalText.style.color=col;signalSub.innerText=`${label} setup from technical + news + AI fusion`;meterValue.innerText=c.toFixed(1);meterValue.style.color=col;needle.style.transform=`rotate(${(c/100*180)-90}deg)`;fusionScore.innerText=(fusion>0?'+':'')+fusion.toFixed(2);aiBiasMini.innerText=d.ai.bias||label;entryVal.innerText=d.tech.entry;riskMini.innerText=(d.ai.risk||'Normal').slice(0,18);aiSummary.innerText=d.ai.summary||'No AI summary returned.';aiScore.innerText=`AI ${Number(d.ai.score||0).toFixed(0)}`;biasTag.innerText='BIAS '+label;biasTag.style.color=col;confTag.innerText='CONF '+c.toFixed(1)+'%';chartLabel.innerText=`${d.asset.name} • Chart ${d.tf} • Signal fixed ${d.signal_tf||"30M"} • Candles + EMA 9/21/50`;
 techStats.innerHTML=[['PRICE',d.tech.price],['RSI 14',d.tech.rsi],['MACD',d.tech.macd],['ATR 14',d.tech.atr],['TARGET',d.tech.target],['STOP LOSS',d.tech.stop]].map(([a,b])=>`<div class="stat-card"><span>${a}</span><b>${b}</b></div>`).join('');
-let layout=d.chart.layout||{};layout.autosize=true;layout.height=null;layout.margin={l:58,r:34,t:22,b:46};layout.paper_bgcolor='rgba(0,0,0,0)';layout.plot_bgcolor='rgba(2,6,23,.34)';layout.font={color:'#eaf2ff',size:11};layout.legend={orientation:'h',y:1.04,x:0,font:{size:10}};layout.xaxis={...(layout.xaxis||{}),type:'date',rangeslider:{visible:false},gridcolor:'rgba(148,163,184,.10)',automargin:true};layout.yaxis={...(layout.yaxis||{}),gridcolor:'rgba(148,163,184,.10)',automargin:true,zeroline:false};Plotly.react('chart',d.chart.data,layout,{displayModeBar:false,responsive:true});setTimeout(()=>Plotly.Plots.resize('chart'),180);
+let layout=d.chart.layout||{};layout.autosize=true;layout.height=null;layout.margin={l:58,r:34,t:22,b:118};layout.paper_bgcolor='rgba(0,0,0,0)';layout.plot_bgcolor='rgba(2,6,23,.34)';layout.font={color:'#eaf2ff',size:11};layout.legend={orientation:'h',y:1.04,x:0,font:{size:10}};layout.dragmode=false;layout.xaxis={...(layout.xaxis||{}),type:'date',rangeslider:{visible:false},gridcolor:'rgba(148,163,184,.10)',automargin:true,tickmode:(layout.xaxis&&layout.xaxis.tickmode)||'array',tickvals:(layout.xaxis&&layout.xaxis.tickvals)||undefined,ticktext:(layout.xaxis&&layout.xaxis.ticktext)||undefined,tickangle:0,tickfont:{size:9,color:'#eaf2ff'},ticklabelstandoff:10,fixedrange:true};layout.yaxis={...(layout.yaxis||{}),gridcolor:'rgba(148,163,184,.10)',automargin:true,zeroline:false,fixedrange:true};const plotlyReadOnlyConfig={displayModeBar:false,responsive:true,scrollZoom:false,editable:false,doubleClick:false};Plotly.react('chart',d.chart.data,layout,plotlyReadOnlyConfig);setTimeout(()=>Plotly.Plots.resize('chart'),180);
 const rows=[['Technical Analysis',Math.round(d.fusion.tech_percent-50)],['News Sentiment',Math.round(d.fusion.news_percent-50)],['Fusion Momentum',Math.round(d.fusion.fusion)],['OpenAI Sentiment',Math.round(d.fusion.ai_percent-50)],['Risk Adjustment',label==='NEUTRAL'?-8:14]];drivers.innerHTML=rows.map(([n,v])=>`<div class="driver"><div class="driver-top"><span>${n}</span><span style="color:${v<0?'#ef4444':'#22c55e'}">${v>0?'+':''}${v}</span></div><div class="track"><div class="fill ${v<0?'neg':''}" style="width:${Math.min(100,Math.abs(v)*2)}%"></div></div></div>`).join('');
 newsCount.innerText=(d.news||[]).length+' items';news.innerHTML=(d.news||[]).slice(0,8).map(n=>`<div class="news-item"><a href="${n.url||'#'}" target="_blank">[${n.source||'News'}] ${n.headline||''}</a></div>`).join('')||'<div class="news-item"><a>No matching news returned.</a></div>'}
 window.addEventListener('resize',()=>{try{Plotly.Plots.resize('chart')}catch(e){}});init();
